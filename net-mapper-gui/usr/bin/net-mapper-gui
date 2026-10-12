@@ -1,0 +1,2 @@
+#!/bin/bash
+exec python3 /usr/share/net-mapper-gui/net_mapper_gui.py "$@"

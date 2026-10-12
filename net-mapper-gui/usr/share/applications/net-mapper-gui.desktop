@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Local Network Scanner
+Comment=Local Network Device Mapper with GitHub Dark UI
+Exec=net-mapper-gui
+Icon=net-mapper-gui
+Terminal=false
+Categories=Utility;Network;
