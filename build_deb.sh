@@ -3,7 +3,7 @@ set -e
 cd "$(dirname "$0")"
 
 PKG="net-mapper-gui"
-VER="${1:-1.1.0}"
+VER="${1:-1.4.4}"
 BUILD="build_deb"
 ICON="net-mapper-gui.png"
 
@@ -22,10 +22,12 @@ mkdir -p "$BUILD/DEBIAN" \
          "$BUILD/usr/bin" \
          "$BUILD/usr/share/$PKG" \
          "$BUILD/usr/share/applications" \
-         "$BUILD/usr/share/icons/hicolor/256x256/apps"
+         "$BUILD/usr/share/icons/hicolor/256x256/apps" \
+         "$BUILD/usr/share/doc/$PKG"
 
 cp net_mapper_gui.py "$BUILD/usr/share/$PKG/net_mapper_gui.py"
 cp "$ICON" "$BUILD/usr/share/icons/hicolor/256x256/apps/$PKG.png"
+[ -f LICENSE ] && cp LICENSE "$BUILD/usr/share/doc/$PKG/copyright"
 
 cat > "$BUILD/usr/bin/$PKG" <<'EOT'
 #!/bin/bash
@@ -61,6 +63,7 @@ EOT
 
 find "$BUILD" -type d -exec chmod 755 {} +
 chmod 644 "$BUILD/usr/share/$PKG/net_mapper_gui.py" "$BUILD/usr/share/applications/$PKG.desktop" "$BUILD/usr/share/icons/hicolor/256x256/apps/$PKG.png" "$BUILD/DEBIAN/control"
+[ -f "$BUILD/usr/share/doc/$PKG/copyright" ] && chmod 644 "$BUILD/usr/share/doc/$PKG/copyright"
 
 dpkg-deb --build --root-owner-group "$BUILD" "$PKG.deb"
 rm -rf "$BUILD"

@@ -5,6 +5,8 @@ import os
 import re
 import shutil
 import subprocess
+import time
+import ipaddress
 import nmap
 from concurrent.futures import ThreadPoolExecutor
 from PyQt6.QtWidgets import (
@@ -15,6 +17,14 @@ from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer
 from PyQt6.QtGui import QColor, QFont, QBrush
 
 CACHE_FILE = "devices_cache.json"
+SUBNET = "192.168.1.0/24"
+
+CAM_PORTS = {554, 8554, 10554, 37777, 34567}
+CAM_KEYWORDS = (
+    "hikvision", "dahua", "reolink", "axis comm", "ezviz", "foscam", "amcrest", "uniview",
+    "annke", "lorex", "vivotek", "xiongmai", "wyze", "eufy", "imou", "hanwha", "wansview",
+    "camera", "ipcam", "ipc-", "nvr", "dvr",
+)
 
 GITHUB_PASTEL_DARK_STYLE = """
 QMainWindow {
@@ -96,16 +106,64 @@ def get_open_ports(nm, host):
 
 def get_arp_table():
     arp = {}
+    net = ipaddress.ip_network(SUBNET)
     try:
         with open("/proc/net/arp") as f:
             next(f)
             for line in f:
                 p = line.split()
                 if len(p) >= 4 and p[3] != "00:00:00:00:00:00":
+                    try:
+                        if ipaddress.ip_address(p[0]) not in net:
+                            continue
+                    except ValueError:
+                        continue
                     arp[p[0]] = p[3].upper()
     except Exception:
         pass
     return arp
+
+def get_local_mac(ip):
+    """MAC del PC locale: l'ARP non lo contiene, lo leggo da /sys/class/net/<iface>/address."""
+    try:
+        out = subprocess.run(["ip", "-o", "-4", "addr"], capture_output=True, text=True, timeout=3).stdout
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 4 and parts[3].split("/")[0] == ip:
+                with open(f"/sys/class/net/{parts[1]}/address") as f:
+                    return f.read().strip().upper()
+    except Exception:
+        pass
+    return "N/D"
+
+def arp_sweep():
+    """Manda un pacchetto UDP a ogni IP della subnet: il kernel fa ARP e popola la tabella.
+    Trova anche Alexa, telefoni, ecc. che non rispondono al ping/TCP di nmap (funziona senza root)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        for ip in ipaddress.ip_network(SUBNET).hosts():
+            try:
+                s.sendto(b"\x00", (str(ip), 9))
+            except OSError:
+                pass
+    finally:
+        s.close()
+    time.sleep(2)
+    return get_arp_table()
+
+def is_camera(device):
+    """Giallo: porte tipiche di telecamere (RTSP ecc.), produttore o nome da camera."""
+    ports = device.get("ports", "-")
+    if "rtsp" in ports.lower():
+        return True
+    for item in ports.split(","):
+        try:
+            if int(item.strip().split("/")[0]) in CAM_PORTS:
+                return True
+        except ValueError:
+            pass
+    name = f"{device.get('name', '')} {device.get('vendor', '')}".lower()
+    return any(k in name for k in CAM_KEYWORDS)
 
 _VENDORS = None
 
@@ -162,12 +220,31 @@ class NetworkScanWorker(QThread):
         current_scan_devices = []
         try:
             nm = nmap.PortScanner()
-            nm.scan(hosts='192.168.1.0/24', arguments='-sn')
-            arp = get_arp_table()
+            nm.scan(hosts=SUBNET, arguments='-sn')
+            arp = arp_sweep()
+            local_ip = get_local_ip()
+
+            known = set(nm.all_hosts())
+            hosts = list(known)
+            for ip in arp:
+                if ip not in known:
+                    hosts.append(ip)
+            try:
+                if local_ip not in hosts and ipaddress.ip_address(local_ip) in ipaddress.ip_network(SUBNET):
+                    hosts.append(local_ip)
+            except ValueError:
+                pass
             
-            for host in nm.all_hosts():
-                hostname = nm[host].hostname() if nm[host].hostname() else "Unknown"
-                mac = nm[host]['addresses'].get('mac') or arp.get(host, "N/D")
+            for host in hosts:
+                hostname = "Unknown"
+                mac = arp.get(host, "N/D")
+                if host in known:
+                    hostname = nm[host].hostname() if nm[host].hostname() else "Unknown"
+                    mac = nm[host]['addresses'].get('mac') or mac
+                if host == local_ip:
+                    local_mac = get_local_mac(local_ip)
+                    if local_mac != "N/D":
+                        mac = local_mac
                 
                 key = mac if mac != "N/D" else host
                 
@@ -179,20 +256,19 @@ class NetworkScanWorker(QThread):
                     "ports": "-"
                 })
 
-            local_ip = get_local_ip()
-
             def resolve(d):
                 name = d["name"]
                 if d["ip"] == local_ip:
                     name = socket.gethostname()
                 if name == "Unknown":
+                    try:
+                        name = socket.gethostbyaddr(d["ip"])[0]
+                    except Exception:
+                        pass
+                if name == "Unknown":
                     name = mdns_name(d["ip"]) or netbios_name(d["ip"]) or "Unknown"
-                vendor = get_vendor(d["mac"])
-                if vendor and name == "Unknown":
-                    name = vendor if vendor != "Private MAC" else "Unknown (Private MAC)"
-                elif vendor and vendor != "Private MAC":
-                    name = f"{name} ({vendor})"
                 d["name"] = name
+                d["vendor"] = get_vendor(d["mac"])
 
             if current_scan_devices:
                 with ThreadPoolExecutor(max_workers=16) as ex:
@@ -201,9 +277,12 @@ class NetworkScanWorker(QThread):
             live = [d["ip"] for d in current_scan_devices]
             if live:
                 ps = nmap.PortScanner()
-                ps.scan(hosts=' '.join(live), arguments='-F -T4 --open')
+                ps.scan(hosts=' '.join(live), arguments='-F -T4 -Pn --open --max-retries 1 --host-timeout 20s')
+                ps2 = nmap.PortScanner()
+                ps2.scan(hosts=' '.join(live), arguments='-p 8554,10554,37777,34567,8008,8009 -T4 -Pn --open --max-retries 1 --host-timeout 20s')
                 for d in current_scan_devices:
-                    d["ports"] = get_open_ports(ps, d["ip"])
+                    parts = [x for x in (get_open_ports(ps, d["ip"]), get_open_ports(ps2, d["ip"])) if x != "-"]
+                    d["ports"] = ", ".join(parts) if parts else "-"
         except Exception as e:
             print(f"Scan error: {e}")
             
@@ -213,7 +292,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Local Network Scanner")
-        self.resize(1040, 580)
+        self.resize(1240, 580)
         
         self.local_ip = get_local_ip()
         
@@ -230,18 +309,20 @@ class MainWindow(QMainWindow):
         
         # Table
         self.table = QTableWidget()
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["IP Address", "Hostname / Device Name", "MAC Address", "Open Ports"])
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(["IP Address", "Hostname", "Device", "MAC Address", "Open Ports"])
         
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
         
         self.table.setColumnWidth(0, 160)
-        self.table.setColumnWidth(2, 170)
-        self.table.setColumnWidth(3, 220)
+        self.table.setColumnWidth(2, 300)
+        self.table.setColumnWidth(3, 170)
+        self.table.setColumnWidth(4, 220)
         
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -265,6 +346,7 @@ class MainWindow(QMainWindow):
         legend_layout.addWidget(create_legend_item("Self", "#cba6f7"))
         legend_layout.addWidget(create_legend_item("Online", "#a6e3a1"))
         legend_layout.addWidget(create_legend_item("Offline", "#f38ba8"))
+        legend_layout.addWidget(create_legend_item("Cam", "#f9e2af"))
         legend_layout.addWidget(create_legend_item("New", "#89b4fa"))
         legend_layout.addStretch()
 
@@ -300,9 +382,15 @@ class MainWindow(QMainWindow):
         current_cache = {}
         combined_display_list = []
 
+        # I "New" restano blu finche' una scansione non trova almeno un dispositivo nuovo
+        new_keys = {dev["key"] for dev in current_devices if dev["key"] not in previous_cache}
+
         for dev in current_devices:
             key = dev["key"]
-            is_new = key not in previous_cache
+            if new_keys:
+                is_new = key in new_keys
+            else:
+                is_new = previous_cache.get(key, {}).get("new", False)
             
             dev_status = "new" if is_new else "online"
             
@@ -310,18 +398,22 @@ class MainWindow(QMainWindow):
                 "ip": dev["ip"],
                 "name": dev["name"],
                 "mac": dev["mac"],
+                "vendor": dev.get("vendor", ""),
                 "ports": dev.get("ports", "-"),
-                "status": "online"
+                "status": "online",
+                "new": is_new
             }
             combined_display_list.append({**dev, "display_status": dev_status})
 
         for key, old_dev in previous_cache.items():
             if key not in current_cache:
+                keep_new = (not new_keys) and old_dev.get("new", False)
                 combined_display_list.append({
                     "key": key,
                     "ip": old_dev["ip"],
                     "name": old_dev["name"],
                     "mac": old_dev["mac"],
+                    "vendor": old_dev.get("vendor", ""),
                     "ports": old_dev.get("ports", "-"),
                     "display_status": "offline"
                 })
@@ -329,8 +421,10 @@ class MainWindow(QMainWindow):
                     "ip": old_dev["ip"],
                     "name": old_dev["name"],
                     "mac": old_dev["mac"],
+                    "vendor": old_dev.get("vendor", ""),
                     "ports": old_dev.get("ports", "-"),
-                    "status": "offline"
+                    "status": "offline",
+                    "new": keep_new
                 }
 
         try:
@@ -350,6 +444,7 @@ class MainWindow(QMainWindow):
         for row, device in enumerate(devices):
             is_me = (device["ip"] == self.local_ip)
             status = device["display_status"]
+            cam = is_camera(device)
             
             dot = "●  "
             
@@ -357,31 +452,38 @@ class MainWindow(QMainWindow):
                 color = QColor("#cba6f7")
             elif status == "offline":
                 color = QColor("#f38ba8")
+            elif cam:
+                color = QColor("#f9e2af")
             elif status == "new":
                 color = QColor("#89b4fa")
             else:
                 color = QColor("#a6e3a1")
 
-            ip_text = f"{dot}{device['ip']} (You)" if is_me else f"{dot}{device['ip']}"
-            if status == "offline":
-                ip_text += " [OFFLINE]"
-
+            ip_text = f"{dot}{device['ip']}"
             ip_item = QTableWidgetItem(ip_text)
             name_text = f"{device['name']} [This PC]" if is_me and device['name'] == "Unknown" else device["name"]
             name_item = QTableWidgetItem(name_text)
+            vendor = device.get("vendor", "")
+            if cam:
+                device_text = f"Camera ({vendor})" if vendor else "Camera"
+            else:
+                device_text = vendor if vendor else "-"
+            device_item = QTableWidgetItem(device_text)
             mac_item = QTableWidgetItem(device["mac"])
             ports_item = QTableWidgetItem(device.get("ports", "-"))
             
             brush = QBrush(color)
             ip_item.setForeground(brush)
             name_item.setForeground(brush)
+            device_item.setForeground(brush)
             mac_item.setForeground(brush)
             ports_item.setForeground(brush)
 
             self.table.setItem(row, 0, ip_item)
             self.table.setItem(row, 1, name_item)
-            self.table.setItem(row, 2, mac_item)
-            self.table.setItem(row, 3, ports_item)
+            self.table.setItem(row, 2, device_item)
+            self.table.setItem(row, 3, mac_item)
+            self.table.setItem(row, 4, ports_item)
             
         self.status_label.setText(f"✨ Scan completed. Data saved to {CACHE_FILE}. Total: {len(devices)}")
         self.scan_button.setEnabled(True)
